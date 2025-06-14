@@ -1,0 +1,228 @@
+import os
+import json
+import socket
+import logging
+import requests
+import threading
+import urllib.parse
+from datetime import datetime
+from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
+from jinja2 import Environment, FileSystemLoader
+from dotenv import load_dotenv
+from urllib.parse import urlparse
+from urllib.parse import urljoin
+import time
+import argparse
+import sys
+
+# Import models
+from models import (
+    Session,
+    InformationGathering,
+    VulnerabilityScan,
+    ManualTesting,
+    Exploitation,
+    PostExploitation,
+    Report
+)
+
+# Import utilities
+from utils import (
+    validate_input,
+    rate_limiter,
+    get_demo_target,
+    list_demo_targets,
+    get_safe_paths,
+    DEMO_TARGETS
+)
+
+# Project structure
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ARTIFACTS_DIR = os.path.join(PROJECT_ROOT, 'artifacts')
+LOGS_DIR = os.path.join(ARTIFACTS_DIR, 'logs')
+DB_DIR = os.path.join(ARTIFACTS_DIR, 'db')
+REPORTS_DIR = os.path.join(ARTIFACTS_DIR, 'reports')
+TEMPLATES_DIR = os.path.join(PROJECT_ROOT, 'src', 'templates')
+PAYLOADS_DIR = os.path.join(PROJECT_ROOT, 'src', 'payloads')
+
+# Create necessary directories
+for directory in [ARTIFACTS_DIR, LOGS_DIR, DB_DIR, REPORTS_DIR]:
+    os.makedirs(directory, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)-8s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, 'pentest.log')),
+        logging.StreamHandler()
+    ]
+)
+
+# Load environment variables
+load_dotenv()
+
+# Load database engine from models
+from models import engine, Session
+
+# Create declarative base
+from models import Base
+
+# Create tables
+# Removed redundant table creation since it's already handled in models/__init__.py
+
+def print_section(title, content=None):
+    """Helper function to print formatted sections."""
+    width = 80
+    print("\n" + "=" * width)
+    print(f" {title} ".center(width, "="))
+    print("=" * width)
+    if content:
+        print(content)
+
+def information_gathering(target):
+    """
+    Perform comprehensive information gathering on the target.
+    This includes port scanning, directory enumeration, technology detection,
+    and searching for sensitive information.
+    """
+    validate_input(target)
+    print_section("Starting Information Gathering")
+    print(f"Target: {target}")
+    logging.info("[INFO] Starting Information Gathering...")
+    
+    findings = {
+        "Basic Information": [],
+        "HTTP Headers": [],
+        "Technologies": [],
+        "Discovered Paths": []
+    }
+    
+    try:
+        parsed_url = urlparse(target)
+        domain = parsed_url.netloc
+        
+        # 1. Basic Information
+        try:
+            ip = socket.gethostbyname(domain)
+            findings["Basic Information"].append(f"IP Address: {ip}")
+            logging.info(f"[INFO] Target IP: {ip}")
+            
+            # Get DNS information
+            try:
+                dns_info = socket.gethostbyaddr(ip)
+                findings["Basic Information"].append(f"Hostname: {dns_info[0]}")
+                if len(dns_info[1]) > 0:
+                    findings["Basic Information"].append(f"Aliases: {', '.join(dns_info[1])}")
+                logging.info(f"[INFO] Hostname: {dns_info[0]}")
+            except socket.herror:
+                logging.warning("[WARNING] Could not retrieve DNS information")
+        except socket.gaierror:
+            logging.error("[ERROR] Could not resolve domain")
+            return
+        
+        # 2. HTTP Headers Analysis
+        try:
+            headers = requests.head(target, allow_redirects=True).headers
+            interesting_headers = [
+                'Server', 'X-Powered-By', 'X-AspNet-Version', 'X-Runtime',
+                'X-Frame-Options', 'X-XSS-Protection', 'Content-Security-Policy',
+                'Strict-Transport-Security', 'X-Content-Type-Options',
+                'Access-Control-Allow-Origin', 'X-Generator', 'X-Backend-Server'
+            ]
+            for header in interesting_headers:
+                if header in headers:
+                    findings["HTTP Headers"].append(f"{header}: {headers[header]}")
+                    logging.info(f"[INFO] {header}: {headers[header]}")
+        except requests.RequestException:
+            logging.error("[ERROR] Failed to retrieve HTTP headers")
+        
+        # 3. Technology Detection
+        try:
+            response = requests.get(target)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Meta tags analysis
+            meta_tags = soup.find_all('meta')
+            for tag in meta_tags:
+                if tag.get('name') in ['generator', 'application-name', 'framework']:
+                    findings["Technologies"].append(f"Meta {tag.get('name')}: {tag.get('content')}")
+            
+            # JavaScript libraries
+            scripts = soup.find_all('script', src=True)
+            js_libs = []
+            for script in scripts:
+                src = script['src']
+                if any(lib in src.lower() for lib in ['jquery', 'angular', 'react', 'vue', 'bootstrap']):
+                    js_libs.append(src)
+            if js_libs:
+                findings["Technologies"].append(f"JavaScript Libraries: {', '.join(js_libs)}")
+            
+            # Common CMS detection
+            cms_indicators = {
+                'wordpress': ['/wp-content', '/wp-includes', 'wp-json'],
+                'drupal': ['/sites/default', '/core/misc', 'drupal.js'],
+                'joomla': ['/administrator', 'joomla.javascript'],
+                'magento': ['/skin/frontend', '/mage/'],
+                'django': ['csrfmiddlewaretoken', '__admin__'],
+                'laravel': ['/vendor/laravel', '_token']
+            }
+            
+            for cms, indicators in cms_indicators.items():
+                if any(indicator in response.text for indicator in indicators):
+                    findings["Technologies"].append(f"CMS Detected: {cms.title()}")
+        except requests.RequestException:
+            logging.error("[ERROR] Failed to analyze website technologies")
+        
+        # 4. Directory and File Enumeration
+        common_paths = [
+            # Admin panels
+            '/admin', '/administrator', '/admincp', '/adminer',
+            '/phpmyadmin', '/wp-admin', '/cpanel', '/webmaster',
+            
+            # Common directories
+            '/backup', '/backups', '/bak', '/old', '/temp', '/tmp',
+            '/logs', '/log', '/debug', '/test', '/testing',
+            '/dev', '/development', '/stage', '/staging',
+            
+            # Configuration files
+            '/.env', '/config.php', '/configuration.php',
+            '/wp-config.php', '/config.yml', '/settings.php',
+            '/.git/config', '/.gitignore', '/composer.json',
+            '/package.json', '/Gemfile', '/requirements.txt',
+            
+            # Information files
+            '/robots.txt', '/sitemap.xml', '/crossdomain.xml',
+            '/phpinfo.php', '/info.php', '/server-status',
+            '/status', '/health', '/metrics',
+            
+            # API endpoints
+            '/api', '/api/v1', '/api/v2', '/rest', '/graphql',
+            '/swagger', '/docs', '/redoc', '/api-docs',
+            
+            # Common web frameworks
+            '/wp-includes', '/wp-content', '/sites/default',
+            '/core', '/vendor', '/node_modules',
+            
+            # Potentially sensitive
+            '/.svn', '/.git', '/.hg', '/.bzr', '/.env.local',
+            '/.env.dev', '/.env.development', '/.env.prod',
+            '/id_rsa', '/id_dsa', '/.ssh', '/.bash_history'
+        ]
+        
+        print_section("Directory Enumeration In Progress")
+        print("Scanning for common paths and sensitive files...")
+        
+        for path in common_paths:
+            try:
+                url = urljoin(target, path)
+                response = requests.head(url, allow_redirects=True)
+                if response.status_code in [200, 301, 302, 403]:
+                    finding = f"{url} (Status: {response.status_code})"
+                    findings["Discovered Paths"].append(finding)
+                    print(f"[+] Found: {finding}")
+                time.sleep(0.5)  # Delay to avoid overwhelming the server
+            except requests.RequestException:
+                continue
